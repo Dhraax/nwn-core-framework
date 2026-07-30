@@ -670,35 +670,61 @@ int UnregisterEventScript(object oTarget, string sEvent = "", string sScripts = 
     string sTarget = ObjectToString(oTarget);
     int i, nRemoved, nCount = CountList(sScripts);
 
+    // Only an empty sScripts means "every script". An empty *item* inside a
+    // non-empty list (from a trailing comma, e.g. "handler_a,") must never
+    // widen the delete to the whole target/event: that would silently remove
+    // unrelated handlers.
+    int bAllScripts = (sScripts == "");
+
     // Count first, then delete. SQLite's RETURNING clause needs 3.35+ and the
     // version bundled with the engine is not guaranteed; changes() would work
     // but depends on statement ordering on the shared module connection.
     // Two plain statements are portable and cheap here - this is not a hot path.
     do
     {
-        string sScript = sScripts == "" ? "" : GetListItem(sScripts, i);
-        string sWhere  = " WHERE object_id = @object_id";
-        if (sEvent != "")
-            sWhere += " AND event = @event";
-        if (sScript != "")
-            sWhere += " AND script = @script";
+        string sScript = bAllScripts ? "" : GetListItem(sScripts, i);
 
-        sqlquery q = SqlPrepareQueryModule("SELECT COUNT(*) FROM event_scripts" + sWhere + ";");
-        SqlBindString(q, "@object_id", sTarget);
-        if (sEvent != "")
-            SqlBindString(q, "@event", sEvent);
-        if (sScript != "")
-            SqlBindString(q, "@script", sScript);
-        if (SqlStep(q))
-            nRemoved += SqlGetInt(q, 0);
+        // Skip empty items produced by a trailing or doubled comma.
+        if (bAllScripts || sScript != "")
+        {
+            string sWhere = " WHERE object_id = @object_id";
+            if (sEvent != "")
+                sWhere += " AND event = @event";
+            if (!bAllScripts)
+                sWhere += " AND script = @script";
 
-        q = SqlPrepareQueryModule("DELETE FROM event_scripts" + sWhere + ";");
-        SqlBindString(q, "@object_id", sTarget);
-        if (sEvent != "")
-            SqlBindString(q, "@event", sEvent);
-        if (sScript != "")
-            SqlBindString(q, "@script", sScript);
-        SqlStep(q);
+            sqlquery q = SqlPrepareQueryModule("SELECT COUNT(*) FROM event_scripts" + sWhere + ";");
+            SqlBindString(q, "@object_id", sTarget);
+            if (sEvent != "")
+                SqlBindString(q, "@event", sEvent);
+            if (!bAllScripts)
+                SqlBindString(q, "@script", sScript);
+
+            int nMatched = SqlStep(q) ? SqlGetInt(q, 0) : 0;
+            if (nMatched)
+            {
+                q = SqlPrepareQueryModule("DELETE FROM event_scripts" + sWhere + ";");
+                SqlBindString(q, "@object_id", sTarget);
+                if (sEvent != "")
+                    SqlBindString(q, "@event", sEvent);
+                if (!bAllScripts)
+                    SqlBindString(q, "@script", sScript);
+                SqlStep(q);
+
+                // Only count what the DELETE actually committed.
+                string sError = SqlGetError(q);
+                if (sError == "")
+                    nRemoved += nMatched;
+                else
+                {
+                    Error("Failed to unregister event script:" +
+                        "\n    Source: " + sTarget +
+                        "\n    Event: " + (sEvent == "" ? "<all>" : sEvent) +
+                        "\n    Script: " + (bAllScripts ? "<all>" : sScript) +
+                        "\n    Error: " + sError, oTarget);
+                }
+            }
+        }
     } while (++i < nCount);
 
     if (nRemoved)
