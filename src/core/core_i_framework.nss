@@ -130,7 +130,29 @@ void ClearEventState(string sEvent = "");
 /// @param fPriority the priority at which the scripts should be executed. If
 ///     -1.0, will use the configured global or local priority, depending on
 ///     whether oTarget is a plugin or other object.
+/// @note Registration is idempotent. Registering the same script to the same
+///     event on the same object twice does not queue it twice; the second call
+///     updates the stored priority instead.
+/// @note Priorities outside the range [0.0, 10.0] that are not one of the
+///     `EVENT_PRIORITY_*` sentinels are clamped into range with a warning. They
+///     are never silently dropped.
 void RegisterEventScript(object oTarget, string sEvent, string sScripts, float fPriority = -1.0);
+
+/// @brief Remove event scripts previously registered to an object.
+/// @param oTarget The object the scripts were attached to.
+/// @param sEvent The name of the event to unregister from. If "", removes
+///     scripts for every event on oTarget.
+/// @param sScripts A CSV list of library scripts to remove. If "", removes
+///     every script matching oTarget and sEvent.
+/// @returns The number of registrations removed.
+/// @note This is the counterpart to RegisterEventScript(). Without it there is
+///     no way to retire a handler for the remaining life of the module.
+/// @warning Do not call this on plugin deactivation as a matter of course.
+///     Plugins that register their scripts from `OnLibraryLoad()` rather than
+///     from an `OnPluginActivate` handler will not re-register when they are
+///     activated again, and the plugin comes back inert. Deactivation already
+///     stops a plugin's scripts from running; see GetIsPluginActivated().
+int UnregisterEventScript(object oTarget, string sEvent = "", string sScripts = "");
 
 /// @brief Run an event, causing all subscribed scripts to trigger.
 /// @param sEvent The name of the event
@@ -358,11 +380,16 @@ void InitializeCoreFramework()
         "source_id TEXT NOT NULL, " +
         "UNIQUE(object_id, source_id)");
 
+    // The UNIQUE constraint makes RegisterEventScript() idempotent. Without it,
+    // any code path that registers the same handler twice - most commonly
+    // deactivating and reactivating a plugin - queues that handler twice for
+    // every future dispatch, with no way to remove the duplicate.
     SqlCreateTableModule("event_scripts",
         "object_id TEXT NOT NULL, " +
         "event TEXT NOT NULL, " +
         "script TEXT NOT NULL, " +
-        "priority REAL NOT NULL DEFAULT 5.0");
+        "priority REAL NOT NULL DEFAULT 5.0, " +
+        "UNIQUE(object_id, event, script)");
 
     SqlCreateTableModule("event_blacklists",
         "object_id TEXT NOT NULL, " +
@@ -566,17 +593,27 @@ void RegisterEventScript(object oTarget, string sEvent, string sScripts, float f
     string sTarget = ObjectToString(oTarget);
     string sPriority = PriorityToString(fPriority);
 
+    // An out-of-range priority used to abort registration entirely. That failed
+    // silently at runtime: the log carried an error, the server kept running,
+    // and the handler was simply never queued. Clamping keeps the handler alive
+    // and still surfaces the mistake. Use EVENT_PRIORITY_FIRST/LAST to order
+    // outside the normal band.
     if ((fPriority < 0.0 || fPriority > 10.0) &&
         (fPriority != EVENT_PRIORITY_FIRST && fPriority != EVENT_PRIORITY_LAST &&
          fPriority != EVENT_PRIORITY_ONLY  && fPriority != EVENT_PRIORITY_DEFAULT))
     {
-        CriticalError("Could not register scripts: " +
+        // util_i_math only ships an int clamp; priorities are floats.
+        float fClamped = fPriority < 0.0 ? 0.0 : (fPriority > 10.0 ? 10.0 : fPriority);
+        Warning("Priority outside expected range; clamping: " +
             "\n    Source: " + sTarget + " (" + GetName(oTarget) + " [" + GetTag(oTarget) + "])" +
             "\n    Event: " + sEvent +
             "\n    Scripts: " + sScripts +
-            "\n    Priority: " + sPriority +
-            "\n    Error: priority outside expected range", oTarget);
-        return;
+            "\n    Requested: " + sPriority +
+            "\n    Applied: " + PriorityToString(fClamped) +
+            "\n    Note: use EVENT_PRIORITY_FIRST or EVENT_PRIORITY_LAST to " +
+            "order outside [0.0, 10.0]", oTarget);
+        fPriority = fClamped;
+        sPriority = PriorityToString(fPriority);
     }
 
     // Handle NWNX script registration.
@@ -612,15 +649,68 @@ void RegisterEventScript(object oTarget, string sEvent, string sScripts, float f
                 "\n    Priority: " + sPriority, DEBUG_LEVEL_DEBUG, oTarget);
         }
 
+        // Upsert rather than insert: re-registering the same script is a no-op
+        // for the queue and simply updates its priority. See the UNIQUE
+        // constraint on event_scripts in InitializeCoreFramework().
         sqlquery q = SqlPrepareQueryModule("INSERT INTO event_scripts " +
                         "(object_id, event, script, priority) VALUES " +
-                        "(@object_id, @event, @script, @priority);");
+                        "(@object_id, @event, @script, @priority) " +
+                        "ON CONFLICT(object_id, event, script) DO UPDATE SET " +
+                        "priority = excluded.priority;");
         SqlBindString(q, "@object_id", sTarget);
         SqlBindString(q, "@event", sEvent);
         SqlBindString(q, "@script", sScript);
         SqlBindFloat(q, "@priority", fPriority);
         SqlStep(q);
     }
+}
+
+int UnregisterEventScript(object oTarget, string sEvent = "", string sScripts = "")
+{
+    string sTarget = ObjectToString(oTarget);
+    int i, nRemoved, nCount = CountList(sScripts);
+
+    // Count first, then delete. SQLite's RETURNING clause needs 3.35+ and the
+    // version bundled with the engine is not guaranteed; changes() would work
+    // but depends on statement ordering on the shared module connection.
+    // Two plain statements are portable and cheap here - this is not a hot path.
+    do
+    {
+        string sScript = sScripts == "" ? "" : GetListItem(sScripts, i);
+        string sWhere  = " WHERE object_id = @object_id";
+        if (sEvent != "")
+            sWhere += " AND event = @event";
+        if (sScript != "")
+            sWhere += " AND script = @script";
+
+        sqlquery q = SqlPrepareQueryModule("SELECT COUNT(*) FROM event_scripts" + sWhere + ";");
+        SqlBindString(q, "@object_id", sTarget);
+        if (sEvent != "")
+            SqlBindString(q, "@event", sEvent);
+        if (sScript != "")
+            SqlBindString(q, "@script", sScript);
+        if (SqlStep(q))
+            nRemoved += SqlGetInt(q, 0);
+
+        q = SqlPrepareQueryModule("DELETE FROM event_scripts" + sWhere + ";");
+        SqlBindString(q, "@object_id", sTarget);
+        if (sEvent != "")
+            SqlBindString(q, "@event", sEvent);
+        if (sScript != "")
+            SqlBindString(q, "@script", sScript);
+        SqlStep(q);
+    } while (++i < nCount);
+
+    if (nRemoved)
+    {
+        Debug("Unregistered " + IntToString(nRemoved) + " event script(s):" +
+            "\n    Source: " + sTarget + " (" + GetName(oTarget) + " [" + GetTag(oTarget) + "])" +
+            "\n    Event: " + (sEvent == "" ? "<all>" : sEvent) +
+            "\n    Scripts: " + (sScripts == "" ? "<all>" : sScripts),
+            DEBUG_LEVEL_DEBUG, oTarget);
+    }
+
+    return nRemoved;
 }
 
 // Alias function for backward compatibility.
@@ -686,7 +776,13 @@ int RunEvent(string sEvent, object oInit = OBJECT_INVALID, object oSelf = OBJECT
     if (nEventLevel)
         OverrideDebugLevel(nEventLevel);
 
-    // Initialize event status
+    // Event state is keyed by event name only, so a nested RunEvent() of the
+    // same name shares one slot with the call that is still running. Saving the
+    // caller's state here and restoring it before returning makes the state
+    // effectively per-invocation: a nested dispatch can no longer clear an
+    // outer ABORT or DENIED. Handlers that trigger the event they are handling
+    // (combat and death flows do this routinely) depended on that not happening.
+    int nOuterState = GetLocalInt(EVENTS, EVENT_STATE + sEvent);
     ClearEventState(sEvent);
 
     if (IsDebugging(DEBUG_LEVEL_DEBUG))
@@ -796,6 +892,13 @@ int RunEvent(string sEvent, object oInit = OBJECT_INVALID, object oSelf = OBJECT
     // Cleanup
     if (nEventLevel)
         OverrideDebugLevel(FALSE);
+
+    // Restore the caller's state. nState already holds this dispatch's own
+    // result, so returning it is unaffected.
+    if (nOuterState)
+        SetLocalInt(EVENTS, EVENT_STATE + sEvent, nOuterState);
+    else
+        DeleteLocalInt(EVENTS, EVENT_STATE + sEvent);
 
     return nState;
 }
